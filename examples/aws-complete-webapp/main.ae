@@ -1,0 +1,925 @@
+// Complete AWS Multi-Tier Application
+// This example demonstrates a production-ready architecture with:
+// - VPC with public/private subnets across multiple AZs
+// - Application Load Balancer
+// - ECS Fargate for containerized applications
+// - RDS Aurora PostgreSQL with read replicas
+// - ElastiCache Redis for caching
+// - S3 for static assets
+// - CloudFront CDN
+// - Route53 for DNS
+// - Secrets Manager for credentials
+// - CloudWatch monitoring and alarms
+
+variable "app_name" {
+  type = string
+  default = "webapp"
+}
+
+variable "environment" {
+  type = string
+  default = "production"
+}
+
+variable "domain_name" {
+  type = string
+  default = "example.com"
+}
+
+provider aws {
+  region = "us-east-1"
+  
+  default_tags = {
+    Application = var.app_name
+    Environment = var.environment
+    ManagedBy = "Aether"
+    CostCenter = "engineering"
+  }
+}
+
+// ============================================================================
+// NETWORKING
+// ============================================================================
+
+resource network.vpc "main" {
+  cidr = "10.0.0.0/16"
+  enable_dns = true
+  enable_dns_hostnames = true
+  
+  tags = { Name = "${var.app_name}-vpc" }
+}
+
+// Public Subnets
+resource network.subnet "public" {
+  count = 3
+  
+  vpc = vpc.main
+  cidr = "10.0.${count.index}.0/24"
+  availability_zone = "us-east-1${["a", "b", "c"][count.index]}"
+  public = true
+  
+  tags = {
+    Name = "${var.app_name}-public-${count.index + 1}"
+    Tier = "public"
+  }
+}
+
+// Private Subnets for Application
+resource network.subnet "app" {
+  count = 3
+  
+  vpc = vpc.main
+  cidr = "10.0.${10 + count.index}.0/24"
+  availability_zone = "us-east-1${["a", "b", "c"][count.index]}"
+  public = false
+  
+  tags = {
+    Name = "${var.app_name}-app-${count.index + 1}"
+    Tier = "app"
+  }
+}
+
+// Private Subnets for Database
+resource network.subnet "db" {
+  count = 3
+  
+  vpc = vpc.main
+  cidr = "10.0.${20 + count.index}.0/24"
+  availability_zone = "us-east-1${["a", "b", "c"][count.index]}"
+  public = false
+  
+  tags = {
+    Name = "${var.app_name}-db-${count.index + 1}"
+    Tier = "database"
+  }
+}
+
+// Private Subnets for Cache
+resource network.subnet "cache" {
+  count = 3
+  
+  vpc = vpc.main
+  cidr = "10.0.${30 + count.index}.0/24"
+  availability_zone = "us-east-1${["a", "b", "c"][count.index]}"
+  public = false
+  
+  tags = {
+    Name = "${var.app_name}-cache-${count.index + 1}"
+    Tier = "cache"
+  }
+}
+
+// Internet Gateway and NAT Gateways
+resource network.internet_gateway "main" {
+  vpc = vpc.main
+  tags = { Name = "${var.app_name}-igw" }
+}
+
+resource network.nat_gateway "main" {
+  count = 3
+  subnet = subnet.public[count.index]
+  tags = { Name = "${var.app_name}-nat-${count.index + 1}" }
+}
+
+// Security Groups
+resource network.security_group "alb" {
+  vpc = vpc.main
+  description = "ALB security group"
+  
+  ingress {
+    from_port = 80
+    to_port = 80
+    protocol = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  ingress {
+    from_port = 443
+    to_port = 443
+    protocol = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  egress {
+    from_port = 0
+    to_port = 0
+    protocol = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = { Name = "${var.app_name}-alb-sg" }
+}
+
+resource network.security_group "app" {
+  vpc = vpc.main
+  description = "Application security group"
+  
+  ingress {
+    from_port = 8080
+    to_port = 8080
+    protocol = "tcp"
+    security_groups = [sg.alb]
+  }
+  
+  egress {
+    from_port = 0
+    to_port = 0
+    protocol = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = { Name = "${var.app_name}-app-sg" }
+}
+
+resource network.security_group "db" {
+  vpc = vpc.main
+  description = "Database security group"
+  
+  ingress {
+    from_port = 5432
+    to_port = 5432
+    protocol = "tcp"
+    security_groups = [sg.app]
+  }
+  
+  egress {
+    from_port = 0
+    to_port = 0
+    protocol = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = { Name = "${var.app_name}-db-sg" }
+}
+
+resource network.security_group "cache" {
+  vpc = vpc.main
+  description = "Cache security group"
+  
+  ingress {
+    from_port = 6379
+    to_port = 6379
+    protocol = "tcp"
+    security_groups = [sg.app]
+  }
+  
+  egress {
+    from_port = 0
+    to_port = 0
+    protocol = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = { Name = "${var.app_name}-cache-sg" }
+}
+
+// ============================================================================
+// SECRETS MANAGEMENT
+// ============================================================================
+
+resource secrets.secret "db_password" {
+  name = "${var.app_name}/db/master-password"
+  description = "Master password for Aurora database"
+  
+  generate_secret_string {
+    password_length = 32
+    exclude_characters = "/@\" "
+    exclude_punctuation = true
+  }
+  
+  rotation_rules {
+    automatically_after_days = 30
+  }
+  
+  tags = {
+    Name = "${var.app_name}-db-password"
+  }
+}
+
+resource secrets.secret "redis_auth_token" {
+  name = "${var.app_name}/cache/auth-token"
+  description = "Auth token for Redis"
+  
+  generate_secret_string {
+    password_length = 64
+    exclude_characters = "/@\" "
+  }
+  
+  tags = {
+    Name = "${var.app_name}-redis-auth"
+  }
+}
+
+// ============================================================================
+// DATABASE - AURORA POSTGRESQL
+// ============================================================================
+
+resource database.subnet_group "main" {
+  name = "${var.app_name}-db-subnet-group"
+  subnets = [subnet.db[0], subnet.db[1], subnet.db[2]]
+  
+  tags = { Name = "${var.app_name}-db-subnet-group" }
+}
+
+resource database.aurora_cluster "main" {
+  cluster_identifier = "${var.app_name}-aurora"
+  
+  engine = "aurora-postgresql"
+  engine_version = "15.3"
+  
+  database_name = var.app_name
+  master_username = "admin"
+  master_password = secret.db_password
+  
+  vpc = vpc.main
+  subnet_group = db_subnet_group.main
+  security_groups = [sg.db]
+  
+  availability_zones = ["us-east-1a", "us-east-1b", "us-east-1c"]
+  
+  backup_retention_period = 14
+  preferred_backup_window = "03:00-04:00"
+  preferred_maintenance_window = "sun:04:00-sun:05:00"
+  
+  storage_encrypted = true
+  
+  enabled_cloudwatch_logs_exports = ["postgresql"]
+  
+  deletion_protection = true
+  
+  tags = { Name = "${var.app_name}-aurora" }
+}
+
+// Writer instance
+resource database.aurora_instance "writer" {
+  identifier = "${var.app_name}-aurora-writer"
+  cluster = aurora.main
+  
+  instance_class = "r6g.2xlarge"
+  
+  performance_insights_enabled = true
+  performance_insights_retention = 7
+  
+  monitoring_interval = 60
+  
+  tags = {
+    Name = "${var.app_name}-aurora-writer"
+    Role = "writer"
+  }
+}
+
+// Reader instances
+resource database.aurora_instance "reader" {
+  count = 2
+  
+  identifier = "${var.app_name}-aurora-reader-${count.index + 1}"
+  cluster = aurora.main
+  
+  instance_class = "r6g.xlarge"
+  
+  performance_insights_enabled = true
+  
+  tags = {
+    Name = "${var.app_name}-aurora-reader-${count.index + 1}"
+    Role = "reader"
+  }
+}
+
+// ============================================================================
+// CACHE - ELASTICACHE REDIS
+// ============================================================================
+
+resource cache.subnet_group "main" {
+  name = "${var.app_name}-cache-subnet-group"
+  subnets = [subnet.cache[0], subnet.cache[1], subnet.cache[2]]
+  
+  tags = { Name = "${var.app_name}-cache-subnet-group" }
+}
+
+resource cache.replication_group "redis" {
+  replication_group_id = "${var.app_name}-redis"
+  description = "Redis cluster for ${var.app_name}"
+  
+  engine = "redis"
+  engine_version = "7.0"
+  
+  node_type = "cache.r6g.large"
+  num_cache_clusters = 3
+  
+  parameter_group_family = "redis7"
+  
+  port = 6379
+  
+  subnet_group = cache_subnet_group.main
+  security_groups = [sg.cache]
+  
+  at_rest_encryption_enabled = true
+  transit_encryption_enabled = true
+  auth_token = secret.redis_auth_token
+  
+  automatic_failover_enabled = true
+  multi_az_enabled = true
+  
+  snapshot_retention_limit = 5
+  snapshot_window = "03:00-05:00"
+  maintenance_window = "sun:05:00-sun:07:00"
+  
+  tags = {
+    Name = "${var.app_name}-redis"
+  }
+}
+
+// ============================================================================
+// CONTAINER ORCHESTRATION - ECS FARGATE
+// ============================================================================
+
+resource compute.ecs_cluster "main" {
+  name = "${var.app_name}-cluster"
+  
+  setting {
+    name = "containerInsights"
+    value = "enabled"
+  }
+  
+  configuration {
+    execute_command_configuration {
+      logging = "OVERRIDE"
+      log_configuration {
+        cloud_watch_log_group_name = log_group.ecs_exec.name
+      }
+    }
+  }
+  
+  tags = { Name = "${var.app_name}-ecs-cluster" }
+}
+
+// IAM Roles
+resource iam.role "ecs_task_execution" {
+  name = "${var.app_name}-ecs-task-execution"
+  
+  assume_role_policy = <<-JSON
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Action": "sts:AssumeRole",
+        "Principal": {
+          "Service": "ecs-tasks.amazonaws.com"
+        },
+        "Effect": "Allow"
+      }
+    ]
+  }
+  JSON
+}
+
+resource iam.role_policy_attachment "ecs_task_execution" {
+  role = role.ecs_task_execution
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource iam.role "ecs_task" {
+  name = "${var.app_name}-ecs-task"
+  
+  assume_role_policy = <<-JSON
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Action": "sts:AssumeRole",
+        "Principal": {
+          "Service": "ecs-tasks.amazonaws.com"
+        },
+        "Effect": "Allow"
+      }
+    ]
+  }
+  JSON
+}
+
+// Task Definition
+resource compute.ecs_task_definition "app" {
+  family = "${var.app_name}-task"
+  
+  network_mode = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  
+  cpu = "2048"
+  memory = "4096"
+  
+  execution_role_arn = role.ecs_task_execution.arn
+  task_role_arn = role.ecs_task.arn
+  
+  container_definitions = <<-JSON
+  [
+    {
+      "name": "app",
+      "image": "123456789.dkr.ecr.us-east-1.amazonaws.com/${var.app_name}:latest",
+      "cpu": 2048,
+      "memory": 4096,
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "ENVIRONMENT",
+          "value": "${var.environment}"
+        },
+        {
+          "name": "DB_HOST",
+          "value": "${aurora.main.endpoint}"
+        },
+        {
+          "name": "DB_READER_HOST",
+          "value": "${aurora.main.reader_endpoint}"
+        },
+        {
+          "name": "REDIS_HOST",
+          "value": "${redis.main.primary_endpoint}"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "DB_PASSWORD",
+          "valueFrom": "${secret.db_password.arn}"
+        },
+        {
+          "name": "REDIS_AUTH_TOKEN",
+          "valueFrom": "${secret.redis_auth_token.arn}"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/${var.app_name}",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+  JSON
+  
+  tags = { Name = "${var.app_name}-task" }
+}
+
+// ECS Service
+resource compute.ecs_service "app" {
+  name = "${var.app_name}-service"
+  cluster = ecs_cluster.main.id
+  task_definition = ecs_task_definition.app.arn
+  
+  desired_count = 3
+  launch_type = "FARGATE"
+  
+  platform_version = "LATEST"
+  
+  network_configuration {
+    subnets = [subnet.app[0], subnet.app[1], subnet.app[2]]
+    security_groups = [sg.app]
+    assign_public_ip = false
+  }
+  
+  load_balancer {
+    target_group_arn = tg.app.arn
+    container_name = "app"
+    container_port = 8080
+  }
+  
+  deployment_configuration {
+    maximum_percent = 200
+    minimum_healthy_percent = 100
+    
+    deployment_circuit_breaker {
+      enable = true
+      rollback = true
+    }
+  }
+  
+  enable_ecs_managed_tags = true
+  propagate_tags = "SERVICE"
+  
+  tags = { Name = "${var.app_name}-ecs-service" }
+}
+
+// Auto Scaling
+resource compute.ecs_service_scaling_target "app" {
+  service = ecs_service.app
+  min_capacity = 3
+  max_capacity = 20
+}
+
+resource compute.ecs_service_scaling_policy "cpu" {
+  name = "${var.app_name}-cpu-scaling"
+  service_scaling_target = ecs_scaling_target.app
+  
+  policy_type = "TargetTrackingScaling"
+  
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    target_value = 70.0
+  }
+}
+
+resource compute.ecs_service_scaling_policy "memory" {
+  name = "${var.app_name}-memory-scaling"
+  service_scaling_target = ecs_scaling_target.app
+  
+  policy_type = "TargetTrackingScaling"
+  
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_type = "ECSServiceAverageMemoryUtilization"
+    target_value = 80.0
+  }
+}
+
+// ============================================================================
+// LOAD BALANCER
+// ============================================================================
+
+resource loadbalancer.application "main" {
+  name = "${var.app_name}-alb"
+  
+  vpc = vpc.main
+  subnets = [subnet.public[0], subnet.public[1], subnet.public[2]]
+  security_groups = [sg.alb]
+  
+  internal = false
+  
+  enable_deletion_protection = true
+  enable_http2 = true
+  
+  access_logs {
+    bucket = bucket.logs
+    prefix = "alb"
+    enabled = true
+  }
+  
+  tags = { Name = "${var.app_name}-alb" }
+}
+
+resource loadbalancer.target_group "app" {
+  name = "${var.app_name}-tg"
+  
+  port = 8080
+  protocol = "HTTP"
+  vpc = vpc.main
+  target_type = "ip"
+  
+  health_check {
+    enabled = true
+    path = "/health"
+    healthy_threshold = 2
+    unhealthy_threshold = 3
+    timeout = 5
+    interval = 30
+    matcher = "200"
+  }
+  
+  deregistration_delay = 30
+  
+  tags = { Name = "${var.app_name}-tg" }
+}
+
+resource loadbalancer.listener "https" {
+  loadbalancer = lb.main
+  port = 443
+  protocol = "HTTPS"
+  ssl_policy = "ELBSecurityPolicy-TLS-1-2-2017-01"
+  certificate_arn = acm_certificate.main.arn
+  
+  default_action {
+    type = "forward"
+    target_group = tg.app
+  }
+}
+
+resource loadbalancer.listener "http" {
+  loadbalancer = lb.main
+  port = 80
+  protocol = "HTTP"
+  
+  default_action {
+    type = "redirect"
+    redirect {
+      protocol = "HTTPS"
+      port = "443"
+      status_code = "HTTP_301"
+    }
+  }
+}
+
+// ============================================================================
+// S3 AND CLOUDFRONT
+// ============================================================================
+
+resource storage.bucket "assets" {
+  bucket_name = "${var.app_name}-assets-${var.environment}"
+  region = "us-east-1"
+  
+  versioning = true
+  encryption_enabled = true
+  
+  lifecycle_rules = [
+    {
+      action = "transition"
+      age_days = 90
+      storage_class = "STANDARD_IA"
+    }
+  ]
+  
+  tags = { Name = "${var.app_name}-assets" }
+}
+
+resource storage.bucket "logs" {
+  bucket_name = "${var.app_name}-logs-${var.environment}"
+  region = "us-east-1"
+  
+  lifecycle_rules = [
+    {
+      action = "transition"
+      age_days = 30
+      storage_class = "STANDARD_IA"
+    },
+    {
+      action = "delete"
+      age_days = 365
+    }
+  ]
+  
+  tags = { Name = "${var.app_name}-logs" }
+}
+
+resource cdn.distribution "main" {
+  enabled = true
+  
+  origin {
+    domain_name = bucket.assets.bucket_regional_domain_name
+    origin_id = "S3-${bucket.assets.id}"
+    
+    s3_origin_config {
+      origin_access_identity = cloudfront_oai.assets.id
+    }
+  }
+  
+  origin {
+    domain_name = lb.main.dns_name
+    origin_id = "ALB"
+    
+    custom_origin_config {
+      http_port = 80
+      https_port = 443
+      origin_protocol_policy = "https-only"
+      origin_ssl_protocols = ["TLSv1.2"]
+    }
+  }
+  
+  default_cache_behavior {
+    target_origin_id = "ALB"
+    viewer_protocol_policy = "redirect-to-https"
+    
+    allowed_methods = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods = ["GET", "HEAD", "OPTIONS"]
+    
+    forwarded_values {
+      query_string = true
+      cookies = "all"
+    }
+    
+    min_ttl = 0
+    default_ttl = 0
+    max_ttl = 0
+  }
+  
+  ordered_cache_behavior {
+    path_pattern = "/static/*"
+    target_origin_id = "S3-${bucket.assets.id}"
+    viewer_protocol_policy = "redirect-to-https"
+    
+    allowed_methods = ["GET", "HEAD", "OPTIONS"]
+    cached_methods = ["GET", "HEAD", "OPTIONS"]
+    
+    min_ttl = 0
+    default_ttl = 86400
+    max_ttl = 31536000
+    
+    compress = true
+  }
+  
+  aliases = [var.domain_name, "www.${var.domain_name}"]
+  
+  viewer_certificate {
+    acm_certificate_arn = acm_certificate.main.arn
+    ssl_support_method = "sni-only"
+    minimum_protocol_version = "TLSv1.2_2021"
+  }
+  
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+  
+  tags = { Name = "${var.app_name}-cdn" }
+}
+
+// ============================================================================
+// ROUTE53
+// ============================================================================
+
+resource dns.hosted_zone "main" {
+  name = var.domain_name
+  tags = { Name = var.domain_name }
+}
+
+resource dns.record "root" {
+  zone = hosted_zone.main
+  name = var.domain_name
+  type = "A"
+  
+  alias {
+    name = cdn.main.domain_name
+    zone_id = cdn.main.hosted_zone_id
+    evaluate_target_health = false
+  }
+}
+
+resource dns.record "www" {
+  zone = hosted_zone.main
+  name = "www.${var.domain_name}"
+  type = "A"
+  
+  alias {
+    name = cdn.main.domain_name
+    zone_id = cdn.main.hosted_zone_id
+    evaluate_target_health = false
+  }
+}
+
+// ============================================================================
+// MONITORING AND ALARMS
+// ============================================================================
+
+resource monitoring.log_group "ecs_exec" {
+  name = "/ecs/${var.app_name}/exec"
+  retention_in_days = 30
+}
+
+resource monitoring.alarm "ecs_cpu_high" {
+  alarm_name = "${var.app_name}-ecs-cpu-high"
+  alarm_description = "ECS CPU utilization is too high"
+  
+  namespace = "AWS/ECS"
+  metric_name = "CPUUtilization"
+  
+  dimensions = {
+    ServiceName = ecs_service.app.name
+    ClusterName = ecs_cluster.main.name
+  }
+  
+  statistic = "Average"
+  period = 300
+  evaluation_periods = 2
+  threshold = 80
+  comparison_operator = "GreaterThanThreshold"
+  
+  alarm_actions = [sns_topic.alerts.arn]
+}
+
+resource monitoring.alarm "aurora_cpu_high" {
+  alarm_name = "${var.app_name}-aurora-cpu-high"
+  alarm_description = "Aurora CPU utilization is too high"
+  
+  namespace = "AWS/RDS"
+  metric_name = "CPUUtilization"
+  
+  dimensions = {
+    DBClusterIdentifier = aurora.main.cluster_identifier
+  }
+  
+  statistic = "Average"
+  period = 300
+  evaluation_periods = 2
+  threshold = 80
+  comparison_operator = "GreaterThanThreshold"
+  
+  alarm_actions = [sns_topic.alerts.arn]
+}
+
+resource monitoring.alarm "alb_5xx_errors" {
+  alarm_name = "${var.app_name}-alb-5xx-errors"
+  alarm_description = "ALB 5XX error rate is too high"
+  
+  namespace = "AWS/ApplicationELB"
+  metric_name = "HTTPCode_Target_5XX_Count"
+  
+  dimensions = {
+    LoadBalancer = lb.main.arn_suffix
+  }
+  
+  statistic = "Sum"
+  period = 300
+  evaluation_periods = 2
+  threshold = 10
+  comparison_operator = "GreaterThanThreshold"
+  
+  alarm_actions = [sns_topic.critical_alerts.arn]
+}
+
+// ============================================================================
+// OUTPUTS
+// ============================================================================
+
+output "vpc_id" {
+  value = vpc.main.id
+  description = "VPC ID"
+}
+
+output "alb_dns_name" {
+  value = lb.main.dns_name
+  description = "Application Load Balancer DNS name"
+}
+
+output "cloudfront_domain" {
+  value = cdn.main.domain_name
+  description = "CloudFront distribution domain"
+}
+
+output "website_url" {
+  value = "https://${var.domain_name}"
+  description = "Website URL"
+}
+
+output "ecs_cluster_name" {
+  value = ecs_cluster.main.name
+  description = "ECS cluster name"
+}
+
+output "aurora_endpoint" {
+  value = aurora.main.endpoint
+  sensitive = true
+  description = "Aurora writer endpoint"
+}
+
+output "aurora_reader_endpoint" {
+  value = aurora.main.reader_endpoint
+  sensitive = true
+  description = "Aurora reader endpoint"
+}
+
+output "redis_endpoint" {
+  value = redis.main.primary_endpoint
+  sensitive = true
+  description = "Redis primary endpoint"
+}

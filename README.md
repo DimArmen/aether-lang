@@ -62,9 +62,11 @@ go install github.com/aether-lang/aether/cmd/aether@latest
 - [Design](DESIGN.md) - Technical design and architecture
 - [Syntax](docs/syntax.md) - Language syntax reference
 - [Providers](docs/providers.md) - Multi-cloud provider system
+- [AWS Guide](docs/aws-guide.md) - Comprehensive AWS provider documentation
 - [AI Agents](docs/ai-agents.md) - AI agent framework
 - [Roadmap](ROADMAP.md) - Development roadmap
 - [Examples](EXAMPLES.md) - Code examples
+- [AWS Examples](examples/README-AWS.md) - AWS-specific examples and tutorials
 
 ## Features
 
