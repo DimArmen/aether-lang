@@ -76,7 +76,8 @@ func (rs *ResourceStatement) String() string {
 // VariableStatement represents a variable declaration
 type VariableStatement struct {
 	Token       lexer.Token      // the 'variable' token
-	Name        *Identifier      // variable name
+	Name        string           // variable name
+	Properties  *BlockExpression // variable properties block
 	Type        *Identifier      // variable type (optional)
 	Default     Expression       // default value (optional)
 	Description *StringLiteral   // description (optional)
@@ -86,26 +87,22 @@ func (vs *VariableStatement) statementNode()       {}
 func (vs *VariableStatement) TokenLiteral() string { return vs.Token.Literal }
 func (vs *VariableStatement) String() string {
 	var out bytes.Buffer
-	out.WriteString("variable ")
-	if vs.Name != nil {
-		out.WriteString(vs.Name.String())
-	}
-	if vs.Type != nil {
+	out.WriteString("variable \"")
+	out.WriteString(vs.Name)
+	out.WriteString("\"")
+	if vs.Properties != nil {
 		out.WriteString(" ")
-		out.WriteString(vs.Type.String())
-	}
-	if vs.Default != nil {
-		out.WriteString(" = ")
-		out.WriteString(vs.Default.String())
+		out.WriteString(vs.Properties.String())
 	}
 	return out.String()
 }
 
 // OutputStatement represents an output declaration
 type OutputStatement struct {
-	Token lexer.Token     // the 'output' token
-	Name  string          // output name
-	Value Expression      // output value
+	Token      lexer.Token      // the 'output' token
+	Name       string           // output name
+	Properties *BlockExpression // output properties block
+	Value      Expression       // output value
 }
 
 func (os *OutputStatement) statementNode()       {}
@@ -123,9 +120,10 @@ func (os *OutputStatement) String() string {
 
 // ModuleStatement represents a module declaration
 type ModuleStatement struct {
-	Token  lexer.Token    // the 'module' token
-	Name   string         // module name
-	Config *MapLiteral    // module configuration
+	Token      lexer.Token      // the 'module' token
+	Name       string           // module name
+	Properties *BlockExpression // module properties block
+	Config     *MapLiteral      // module configuration
 }
 
 func (ms *ModuleStatement) statementNode()       {}
@@ -143,10 +141,11 @@ func (ms *ModuleStatement) String() string {
 
 // AgentStatement represents an agent declaration
 type AgentStatement struct {
-	Token     lexer.Token    // the 'agent' token
-	AgentType string         // agent type (e.g., "openai", "anthropic")
-	Name      string         // agent name
-	Config    *MapLiteral    // agent configuration
+	Token      lexer.Token      // the 'agent' token
+	AgentType  string           // agent type (e.g., "openai", "anthropic")
+	Name       string           // agent name
+	Properties *BlockExpression // agent properties block
+	Config     *MapLiteral      // agent configuration
 }
 
 func (as *AgentStatement) statementNode()       {}
@@ -197,6 +196,26 @@ func (es *ExpressionStatement) String() string {
 		return es.Expression.String()
 	}
 	return ""
+}
+
+// LetStatement represents a variable declaration (let x = value)
+type LetStatement struct {
+	Token lexer.Token // the 'let' token
+	Name  string      // variable name
+	Value Expression  // the value expression
+}
+
+func (ls *LetStatement) statementNode()       {}
+func (ls *LetStatement) TokenLiteral() string { return ls.Token.Literal }
+func (ls *LetStatement) String() string {
+	var out bytes.Buffer
+	out.WriteString("let ")
+	out.WriteString(ls.Name)
+	out.WriteString(" = ")
+	if ls.Value != nil {
+		out.WriteString(ls.Value.String())
+	}
+	return out.String()
 }
 
 // AssignmentStatement represents an assignment
@@ -307,6 +326,25 @@ func (bs *BlockStatement) String() string {
 	return out.String()
 }
 
+// BlockExpression represents a block that can be used as an expression
+type BlockExpression struct {
+	Token      lexer.Token // the '{' token
+	Statements []Statement
+}
+
+func (be *BlockExpression) expressionNode()      {}
+func (be *BlockExpression) TokenLiteral() string { return be.Token.Literal }
+func (be *BlockExpression) String() string {
+	var out bytes.Buffer
+	out.WriteString("{ ")
+	for _, s := range be.Statements {
+		out.WriteString(s.String())
+		out.WriteString(" ")
+	}
+	out.WriteString("}")
+	return out.String()
+}
+
 // ============================================================================
 // Expression Types
 // ============================================================================
@@ -364,6 +402,36 @@ func (bl *BooleanLiteral) String() string {
 		return "true"
 	}
 	return "false"
+}
+
+// NumberLiteral represents a numeric literal (int or float)
+type NumberLiteral struct {
+	Token lexer.Token
+	Value float64
+}
+
+func (nl *NumberLiteral) expressionNode()      {}
+func (nl *NumberLiteral) TokenLiteral() string { return nl.Token.Literal }
+func (nl *NumberLiteral) String() string       { return nl.Token.Literal }
+
+// ListLiteral is an alias for ArrayLiteral for parser compatibility
+type ListLiteral struct {
+	Token    lexer.Token // the '[' token
+	Elements []Expression
+}
+
+func (ll *ListLiteral) expressionNode()      {}
+func (ll *ListLiteral) TokenLiteral() string { return ll.Token.Literal }
+func (ll *ListLiteral) String() string {
+	var out bytes.Buffer
+	elements := []string{}
+	for _, el := range ll.Elements {
+		elements = append(elements, el.String())
+	}
+	out.WriteString("[")
+	out.WriteString(strings.Join(elements, ", "))
+	out.WriteString("]")
+	return out.String()
 }
 
 // ArrayLiteral represents an array literal
@@ -520,5 +588,28 @@ func (te *TernaryExpression) String() string {
 	out.WriteString(" : ")
 	out.WriteString(te.Alternative.String())
 	out.WriteString(")")
+	return out.String()
+}
+
+// IfExpression represents an if-else expression
+type IfExpression struct {
+	Token       lexer.Token      // the 'if' token
+	Condition   Expression       // the condition
+	Consequence *BlockExpression // the consequence block
+	Alternative *BlockExpression // the alternative block (optional)
+}
+
+func (ie *IfExpression) expressionNode()      {}
+func (ie *IfExpression) TokenLiteral() string { return ie.Token.Literal }
+func (ie *IfExpression) String() string {
+	var out bytes.Buffer
+	out.WriteString("if ")
+	out.WriteString(ie.Condition.String())
+	out.WriteString(" ")
+	out.WriteString(ie.Consequence.String())
+	if ie.Alternative != nil {
+		out.WriteString(" else ")
+		out.WriteString(ie.Alternative.String())
+	}
 	return out.String()
 }
