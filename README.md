@@ -1,6 +1,12 @@
 # Aether
 
+[![GitHub](https://img.shields.io/badge/GitHub-DimArmen%2Faether--lang-blue?logo=github)](https://github.com/DimArmen/aether-lang)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go)](https://go.dev)
+
 A next-generation Infrastructure as Code language with AI-powered intelligence.
+
+> **Status:** Early development (v0.1.0-alpha) - Core lexer, parser, and CLI framework complete. Actively implementing runtime and provider integrations.
 
 ## Quick Start
 
