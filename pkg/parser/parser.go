@@ -126,9 +126,64 @@ func (p *Parser) parseResourceStatement() *ast.ResourceStatement {
 		return nil
 	}
 
-	stmt.Properties = p.parseBlockExpression()
+	stmt.Properties = p.parseResourceProperties()
 
 	return stmt
+}
+
+func (p *Parser) parseResourceProperties() *ast.BlockExpression {
+	block := &ast.BlockExpression{Token: p.curToken}
+	block.Statements = []ast.Statement{}
+
+	p.nextToken()
+
+	for !p.curTokenIs(lexer.TokenRBrace) && !p.curTokenIs(lexer.TokenEOF) {
+		// Skip comments and illegal tokens
+		if p.curTokenIs(lexer.TokenIllegal) {
+			p.nextToken()
+			continue
+		}
+
+		// Handle property assignment: key = value
+		if p.curTokenIs(lexer.TokenIdent) {
+			// This could be a simple assignment or a nested block
+			key := p.curToken.Literal
+			keyToken := p.curToken
+
+			if p.peekTokenIs(lexer.TokenAssign) {
+				// Simple assignment: key = value
+				p.nextToken() // move to =
+				p.nextToken() // move to value
+
+				value := p.parseExpression(LOWEST)
+
+				// Create an assignment statement
+				stmt := &ast.AssignmentStatement{
+					Token: keyToken,
+					Name:  &ast.Identifier{Token: keyToken, Value: key},
+					Value: value,
+				}
+				block.Statements = append(block.Statements, stmt)
+			} else if p.peekTokenIs(lexer.TokenLBrace) {
+				// Nested block: ingress { ... }
+				p.nextToken() // move to {
+
+				nestedBlock := p.parseResourceProperties()
+
+				// Create a block assignment
+				stmt := &ast.AssignmentStatement{
+					Token: keyToken,
+					Name:  &ast.Identifier{Token: keyToken, Value: key},
+					Value: nestedBlock,
+				}
+				block.Statements = append(block.Statements, stmt)
+			}
+		}
+
+		p.nextToken()
+	}
+
+	return block
 }
 
 func (p *Parser) parseVariableStatement() *ast.VariableStatement {
@@ -143,7 +198,7 @@ func (p *Parser) parseVariableStatement() *ast.VariableStatement {
 		return nil
 	}
 
-	stmt.Properties = p.parseBlockExpression()
+	stmt.Properties = p.parseResourceProperties()
 
 	return stmt
 }
@@ -160,7 +215,7 @@ func (p *Parser) parseOutputStatement() *ast.OutputStatement {
 		return nil
 	}
 
-	stmt.Properties = p.parseBlockExpression()
+	stmt.Properties = p.parseResourceProperties()
 
 	return stmt
 }
@@ -177,7 +232,7 @@ func (p *Parser) parseModuleStatement() *ast.ModuleStatement {
 		return nil
 	}
 
-	stmt.Properties = p.parseBlockExpression()
+	stmt.Properties = p.parseResourceProperties()
 
 	return stmt
 }
@@ -194,7 +249,7 @@ func (p *Parser) parseAgentStatement() *ast.AgentStatement {
 		return nil
 	}
 
-	stmt.Properties = p.parseBlockExpression()
+	stmt.Properties = p.parseResourceProperties()
 
 	return stmt
 }

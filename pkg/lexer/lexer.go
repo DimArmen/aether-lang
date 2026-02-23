@@ -256,7 +256,13 @@ func (l *Lexer) skipWhitespace() {
 
 func (l *Lexer) skipComments() {
 	for {
-		if l.ch == '/' && l.peekChar() == '/' {
+		if l.ch == '#' {
+			// Hash-style single-line comment (like Python/Ruby/Shell)
+			for l.ch != '\n' && l.ch != 0 {
+				l.readChar()
+			}
+			l.skipWhitespace()
+		} else if l.ch == '/' && l.peekChar() == '/' {
 			// Single-line comment
 			for l.ch != '\n' && l.ch != 0 {
 				l.readChar()

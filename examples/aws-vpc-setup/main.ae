@@ -1,0 +1,390 @@
+// AWS VPC Setup with Public and Private Subnets
+// This example creates a production-ready VPC with:
+// - Multiple availability zones
+// - Public and private subnets
+// - NAT gateways for high availability
+// - Security groups for different tiers
+
+variable "environment" {
+  type = string
+  default = "production"
+  description = "Environment name"
+}
+
+variable "vpc_cidr" {
+  type = string
+  default = "10.0.0.0/16"
+  description = "VPC CIDR block"
+}
+
+provider aws {
+  region = "us-east-1"
+  
+  default_tags = {
+    Environment = var.environment
+    ManagedBy = "Aether"
+    Project = "vpc-setup"
+  }
+}
+
+// VPC
+resource network.vpc "main" {
+  cidr = var.vpc_cidr
+  region = "us-east-1"
+  
+  enable_dns = true
+  enable_dns_hostnames = true
+  
+  tags = {
+    Name = "main-vpc-${var.environment}"
+  }
+}
+
+// Public Subnets (2 AZs for high availability)
+resource network.subnet "public_1a" {
+  vpc = vpc.main
+  cidr = "10.0.1.0/24"
+  availability_zone = "us-east-1a"
+  public = true
+  
+  tags = {
+    Name = "public-subnet-1a"
+    Tier = "public"
+  }
+}
+
+resource network.subnet "public_1b" {
+  vpc = vpc.main
+  cidr = "10.0.2.0/24"
+  availability_zone = "us-east-1b"
+  public = true
+  
+  tags = {
+    Name = "public-subnet-1b"
+    Tier = "public"
+  }
+}
+
+// Private Subnets for Application Layer
+resource network.subnet "app_1a" {
+  vpc = vpc.main
+  cidr = "10.0.10.0/24"
+  availability_zone = "us-east-1a"
+  public = false
+  
+  tags = {
+    Name = "app-subnet-1a"
+    Tier = "application"
+  }
+}
+
+resource network.subnet "app_1b" {
+  vpc = vpc.main
+  cidr = "10.0.11.0/24"
+  availability_zone = "us-east-1b"
+  public = false
+  
+  tags = {
+    Name = "app-subnet-1b"
+    Tier = "application"
+  }
+}
+
+// Private Subnets for Database Layer
+resource network.subnet "db_1a" {
+  vpc = vpc.main
+  cidr = "10.0.20.0/24"
+  availability_zone = "us-east-1a"
+  public = false
+  
+  tags = {
+    Name = "db-subnet-1a"
+    Tier = "database"
+  }
+}
+
+resource network.subnet "db_1b" {
+  vpc = vpc.main
+  cidr = "10.0.21.0/24"
+  availability_zone = "us-east-1b"
+  public = false
+  
+  tags = {
+    Name = "db-subnet-1b"
+    Tier = "database"
+  }
+}
+
+// Internet Gateway
+resource network.internet_gateway "main" {
+  vpc = vpc.main
+  
+  tags = {
+    Name = "main-igw"
+  }
+}
+
+// NAT Gateways (one per AZ for HA)
+resource network.nat_gateway "nat_1a" {
+  subnet = subnet.public_1a
+  
+  tags = {
+    Name = "nat-gateway-1a"
+  }
+}
+
+resource network.nat_gateway "nat_1b" {
+  subnet = subnet.public_1b
+  
+  tags = {
+    Name = "nat-gateway-1b"
+  }
+}
+
+// Route Tables - Public
+resource network.route_table "public" {
+  vpc = vpc.main
+  
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway = igw.main
+  }
+  
+  tags = {
+    Name = "public-rt"
+  }
+}
+
+// Associate public subnets with public route table
+resource network.route_table_association "public_1a" {
+  subnet = subnet.public_1a
+  route_table = rt.public
+}
+
+resource network.route_table_association "public_1b" {
+  subnet = subnet.public_1b
+  route_table = rt.public
+}
+
+// Route Tables - Private (separate for each AZ)
+resource network.route_table "app_1a" {
+  vpc = vpc.main
+  
+  route {
+    cidr_block = "0.0.0.0/0"
+    nat_gateway = nat.nat_1a
+  }
+  
+  tags = {
+    Name = "app-rt-1a"
+  }
+}
+
+resource network.route_table "app_1b" {
+  vpc = vpc.main
+  
+  route {
+    cidr_block = "0.0.0.0/0"
+    nat_gateway = nat.nat_1b
+  }
+  
+  tags = {
+    Name = "app-rt-1b"
+  }
+}
+
+// Associate app subnets
+resource network.route_table_association "app_1a" {
+  subnet = subnet.app_1a
+  route_table = rt.app_1a
+}
+
+resource network.route_table_association "app_1b" {
+  subnet = subnet.app_1b
+  route_table = rt.app_1b
+}
+
+// Database subnets use same route tables as app layer
+resource network.route_table_association "db_1a" {
+  subnet = subnet.db_1a
+  route_table = rt.app_1a
+}
+
+resource network.route_table_association "db_1b" {
+  subnet = subnet.db_1b
+  route_table = rt.app_1b
+}
+
+// Security Groups
+resource network.security_group "alb" {
+  vpc = vpc.main
+  description = "Security group for Application Load Balancer"
+  
+  ingress {
+    from_port = 80
+    to_port = 80
+    protocol = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "HTTP from anywhere"
+  }
+  
+  ingress {
+    from_port = 443
+    to_port = 443
+    protocol = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "HTTPS from anywhere"
+  }
+  
+  egress {
+    from_port = 0
+    to_port = 0
+    protocol = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = {
+    Name = "alb-sg"
+  }
+}
+
+resource network.security_group "web" {
+  vpc = vpc.main
+  description = "Security group for web tier"
+  
+  ingress {
+    from_port = 80
+    to_port = 80
+    protocol = "tcp"
+    security_groups = [sg.alb]
+    description = "HTTP from ALB"
+  }
+  
+  ingress {
+    from_port = 443
+    to_port = 443
+    protocol = "tcp"
+    security_groups = [sg.alb]
+    description = "HTTPS from ALB"
+  }
+  
+  egress {
+    from_port = 0
+    to_port = 0
+    protocol = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = {
+    Name = "web-sg"
+  }
+}
+
+resource network.security_group "app" {
+  vpc = vpc.main
+  description = "Security group for application tier"
+  
+  ingress {
+    from_port = 8080
+    to_port = 8080
+    protocol = "tcp"
+    security_groups = [sg.web]
+    description = "App port from web tier"
+  }
+  
+  egress {
+    from_port = 0
+    to_port = 0
+    protocol = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = {
+    Name = "app-sg"
+  }
+}
+
+resource network.security_group "database" {
+  vpc = vpc.main
+  description = "Security group for database tier"
+  
+  ingress {
+    from_port = 5432
+    to_port = 5432
+    protocol = "tcp"
+    security_groups = [sg.app]
+    description = "PostgreSQL from app tier"
+  }
+  
+  ingress {
+    from_port = 3306
+    to_port = 3306
+    protocol = "tcp"
+    security_groups = [sg.app]
+    description = "MySQL from app tier"
+  }
+  
+  egress {
+    from_port = 0
+    to_port = 0
+    protocol = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = {
+    Name = "database-sg"
+  }
+}
+
+// VPC Flow Logs
+resource network.flow_log "main" {
+  vpc = vpc.main
+  traffic_type = "ALL"
+  
+  log_destination = cloudwatch_log_group.vpc_flow.arn
+  log_destination_type = "cloud-watch-logs"
+  
+  tags = {
+    Name = "vpc-flow-logs"
+  }
+}
+
+resource monitoring.log_group "vpc_flow" {
+  name = "/aws/vpc/flow-logs"
+  retention_in_days = 30
+  
+  tags = {
+    Name = "vpc-flow-logs"
+  }
+}
+
+// Outputs
+output "vpc_id" {
+  value = vpc.main.id
+  description = "VPC ID"
+}
+
+output "public_subnet_ids" {
+  value = [subnet.public_1a.id, subnet.public_1b.id]
+  description = "Public subnet IDs"
+}
+
+output "app_subnet_ids" {
+  value = [subnet.app_1a.id, subnet.app_1b.id]
+  description = "Application subnet IDs"
+}
+
+output "db_subnet_ids" {
+  value = [subnet.db_1a.id, subnet.db_1b.id]
+  description = "Database subnet IDs"
+}
+
+output "security_group_ids" {
+  value = {
+    alb = sg.alb.id
+    web = sg.web.id
+    app = sg.app.id
+    database = sg.database.id
+  }
+  description = "Security group IDs"
+}

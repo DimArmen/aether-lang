@@ -1,0 +1,555 @@
+// AWS EC2 Auto Scaling Group Example
+// This example demonstrates:
+// - Launch template configuration
+// - Auto Scaling Group with target tracking
+// - Application Load Balancer integration
+// - CloudWatch monitoring and alarms
+
+variable "app_name" {
+  type = string
+  default = "myapp"
+}
+
+variable "environment" {
+  type = string
+  default = "production"
+}
+
+variable "min_size" {
+  type = number
+  default = 2
+}
+
+variable "max_size" {
+  type = number
+  default = 10
+}
+
+variable "desired_capacity" {
+  type = number
+  default = 3
+}
+
+provider aws {
+  region = "us-east-1"
+  
+  default_tags = {
+    Application = var.app_name
+    Environment = var.environment
+    ManagedBy = "Aether"
+  }
+}
+
+// Import network configuration from VPC setup
+import "vpc" from "./network.ae"
+
+// IAM Role for EC2 instances
+resource iam.role "ec2" {
+  name = "${var.app_name}-ec2-role"
+  
+  assume_role_policy = <<-JSON
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Action": "sts:AssumeRole",
+        "Principal": {
+          "Service": "ec2.amazonaws.com"
+        },
+        "Effect": "Allow"
+      }
+    ]
+  }
+  JSON
+  
+  tags = {
+    Name = "${var.app_name}-ec2-role"
+  }
+}
+
+// Attach policies to role
+resource iam.role_policy_attachment "ssm" {
+  role = role.ec2
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource iam.role_policy_attachment "cloudwatch" {
+  role = role.ec2
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
+resource iam.instance_profile "ec2" {
+  name = "${var.app_name}-ec2-profile"
+  role = role.ec2
+}
+
+// Application Load Balancer
+resource loadbalancer.application "main" {
+  name = "${var.app_name}-alb"
+  
+  vpc = vpc.main
+  subnets = [subnet.public_1a, subnet.public_1b]
+  security_groups = [sg.alb]
+  
+  internal = false
+  
+  enable_deletion_protection = true
+  enable_http2 = true
+  enable_cross_zone_load_balancing = true
+  
+  access_logs {
+    bucket = bucket.logs
+    prefix = "alb-logs"
+    enabled = true
+  }
+  
+  tags = {
+    Name = "${var.app_name}-alb"
+  }
+}
+
+// Target Group
+resource loadbalancer.target_group "app" {
+  name = "${var.app_name}-tg"
+  
+  port = 8080
+  protocol = "HTTP"
+  vpc = vpc.main
+  
+  target_type = "instance"
+  
+  health_check {
+    enabled = true
+    path = "/health"
+    port = "8080"
+    protocol = "HTTP"
+    healthy_threshold = 2
+    unhealthy_threshold = 3
+    timeout = 5
+    interval = 30
+    matcher = "200"
+  }
+  
+  deregistration_delay = 30
+  
+  stickiness {
+    enabled = true
+    type = "lb_cookie"
+    cookie_duration = 86400
+  }
+  
+  tags = {
+    Name = "${var.app_name}-target-group"
+  }
+}
+
+// HTTPS Listener (with redirect from HTTP)
+resource loadbalancer.listener "https" {
+  loadbalancer = lb.main
+  port = 443
+  protocol = "HTTPS"
+  ssl_policy = "ELBSecurityPolicy-TLS-1-2-2017-01"
+  certificate_arn = acm_certificate.main.arn
+  
+  default_action {
+    type = "forward"
+    target_group = tg.app
+  }
+}
+
+resource loadbalancer.listener "http" {
+  loadbalancer = lb.main
+  port = 80
+  protocol = "HTTP"
+  
+  default_action {
+    type = "redirect"
+    redirect {
+      protocol = "HTTPS"
+      port = "443"
+      status_code = "HTTP_301"
+    }
+  }
+}
+
+// Launch Template
+resource compute.launch_template "app" {
+  name_prefix = "${var.app_name}-lt-"
+  
+  image_id = "ami-0c55b159cbfafe1f0"  // Ubuntu 22.04 LTS
+  instance_type = "t3.medium"
+  
+  key_name = "my-keypair"
+  
+  vpc_security_group_ids = [sg.app]
+  
+  iam_instance_profile {
+    name = instance_profile.ec2.name
+  }
+  
+  monitoring {
+    enabled = true
+  }
+  
+  // Root volume
+  block_device_mappings {
+    device_name = "/dev/sda1"
+    
+    ebs {
+      volume_size = 30
+      volume_type = "gp3"
+      iops = 3000
+      throughput = 125
+      encrypted = true
+      delete_on_termination = true
+    }
+  }
+  
+  // Metadata options (IMDSv2)
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens = "required"
+    http_put_response_hop_limit = 1
+    instance_metadata_tags = "enabled"
+  }
+  
+  // User data script
+  user_data = base64encode(<<-EOF
+    #!/bin/bash
+    set -e
+    
+    # Update system
+    apt-get update
+    apt-get upgrade -y
+    
+    # Install Docker
+    apt-get install -y docker.io
+    systemctl start docker
+    systemctl enable docker
+    
+    # Install CloudWatch agent
+    wget https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+    dpkg -i -E ./amazon-cloudwatch-agent.deb
+    
+    # Configure CloudWatch agent
+    cat > /opt/aws/amazon-cloudwatch-agent/etc/config.json <<EOC
+    {
+      "metrics": {
+        "namespace": "${var.app_name}",
+        "metrics_collected": {
+          "cpu": {
+            "measurement": [
+              {"name": "cpu_usage_idle", "rename": "CPU_IDLE", "unit": "Percent"}
+            ],
+            "totalcpu": false
+          },
+          "disk": {
+            "measurement": [
+              {"name": "used_percent", "rename": "DISK_USED", "unit": "Percent"}
+            ]
+          },
+          "mem": {
+            "measurement": [
+              {"name": "mem_used_percent", "rename": "MEM_USED", "unit": "Percent"}
+            ]
+          }
+        }
+      },
+      "logs": {
+        "logs_collected": {
+          "files": {
+            "collect_list": [
+              {
+                "file_path": "/var/log/application.log",
+                "log_group_name": "/aws/ec2/${var.app_name}",
+                "log_stream_name": "{instance_id}"
+              }
+            ]
+          }
+        }
+      }
+    }
+    EOC
+    
+    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+      -a fetch-config \
+      -m ec2 \
+      -s \
+      -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json
+    
+    # Pull and run application
+    docker pull ${var.app_name}:latest
+    docker run -d \
+      --name app \
+      --restart always \
+      -p 8080:8080 \
+      -e ENVIRONMENT=${var.environment} \
+      ${var.app_name}:latest
+    
+    # Wait for application to be healthy
+    until curl -f http://localhost:8080/health; do
+      sleep 5
+    done
+    
+    echo "Application started successfully"
+  EOF
+  )
+  
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "${var.app_name}-instance"
+      Environment = var.environment
+    }
+  }
+  
+  tag_specifications {
+    resource_type = "volume"
+    tags = {
+      Name = "${var.app_name}-volume"
+      Environment = var.environment
+    }
+  }
+}
+
+// Auto Scaling Group
+resource compute.auto_scaling_group "app" {
+  name = "${var.app_name}-asg"
+  
+  launch_template {
+    id = lt.app.id
+    version = "$Latest"
+  }
+  
+  min_size = var.min_size
+  max_size = var.max_size
+  desired_capacity = var.desired_capacity
+  
+  vpc_zone_identifier = [subnet.app_1a, subnet.app_1b]
+  
+  target_group_arns = [tg.app.arn]
+  
+  health_check_type = "ELB"
+  health_check_grace_period = 300
+  
+  default_cooldown = 300
+  
+  termination_policies = [
+    "OldestLaunchTemplate",
+    "OldestInstance"
+  ]
+  
+  enabled_metrics = [
+    "GroupDesiredCapacity",
+    "GroupInServiceInstances",
+    "GroupMaxSize",
+    "GroupMinSize",
+    "GroupPendingInstances",
+    "GroupStandbyInstances",
+    "GroupTerminatingInstances",
+    "GroupTotalInstances"
+  ]
+  
+  // Instance refresh for rolling updates
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 50
+      instance_warmup = 300
+    }
+  }
+  
+  tags = [
+    {
+      key = "Name"
+      value = "${var.app_name}-asg-instance"
+      propagate_at_launch = true
+    },
+    {
+      key = "Environment"
+      value = var.environment
+      propagate_at_launch = true
+    }
+  ]
+}
+
+// Auto Scaling Policies
+resource compute.auto_scaling_policy "cpu_target" {
+  name = "${var.app_name}-cpu-target-tracking"
+  autoscaling_group_name = asg.app.name
+  
+  policy_type = "TargetTrackingScaling"
+  
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ASGAverageCPUUtilization"
+    }
+    target_value = 70.0
+    scale_in_cooldown = 300
+    scale_out_cooldown = 60
+  }
+}
+
+resource compute.auto_scaling_policy "request_count" {
+  name = "${var.app_name}-request-count-target"
+  autoscaling_group_name = asg.app.name
+  
+  policy_type = "TargetTrackingScaling"
+  
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ALBRequestCountPerTarget"
+      resource_label = "${lb.main.arn_suffix}/${tg.app.arn_suffix}"
+    }
+    target_value = 1000.0
+  }
+}
+
+// CloudWatch Alarms
+resource monitoring.alarm "high_cpu" {
+  alarm_name = "${var.app_name}-high-cpu"
+  alarm_description = "Alert when CPU exceeds 80%"
+  
+  namespace = "AWS/EC2"
+  metric_name = "CPUUtilization"
+  
+  dimensions = {
+    AutoScalingGroupName = asg.app.name
+  }
+  
+  statistic = "Average"
+  period = 300
+  evaluation_periods = 2
+  threshold = 80
+  comparison_operator = "GreaterThanThreshold"
+  
+  alarm_actions = [sns_topic.alerts.arn]
+  ok_actions = [sns_topic.alerts.arn]
+  
+  treat_missing_data = "notBreaching"
+}
+
+resource monitoring.alarm "unhealthy_hosts" {
+  alarm_name = "${var.app_name}-unhealthy-hosts"
+  alarm_description = "Alert when unhealthy host count > 0"
+  
+  namespace = "AWS/ApplicationELB"
+  metric_name = "UnHealthyHostCount"
+  
+  dimensions = {
+    TargetGroup = tg.app.arn_suffix
+    LoadBalancer = lb.main.arn_suffix
+  }
+  
+  statistic = "Average"
+  period = 60
+  evaluation_periods = 2
+  threshold = 0
+  comparison_operator = "GreaterThanThreshold"
+  
+  alarm_actions = [sns_topic.critical_alerts.arn]
+}
+
+resource monitoring.alarm "target_response_time" {
+  alarm_name = "${var.app_name}-slow-response"
+  alarm_description = "Alert when P99 response time exceeds 2 seconds"
+  
+  namespace = "AWS/ApplicationELB"
+  metric_name = "TargetResponseTime"
+  
+  dimensions = {
+    LoadBalancer = lb.main.arn_suffix
+  }
+  
+  extended_statistic = "p99"
+  period = 300
+  evaluation_periods = 2
+  threshold = 2.0
+  comparison_operator = "GreaterThanThreshold"
+  
+  alarm_actions = [sns_topic.alerts.arn]
+}
+
+// CloudWatch Dashboard
+resource monitoring.dashboard "app" {
+  dashboard_name = "${var.app_name}-dashboard"
+  
+  dashboard_body = <<-JSON
+  {
+    "widgets": [
+      {
+        "type": "metric",
+        "properties": {
+          "metrics": [
+            ["AWS/EC2", "CPUUtilization", {"stat": "Average", "label": "CPU Average"}],
+            ["...", {"stat": "Maximum", "label": "CPU Max"}]
+          ],
+          "period": 300,
+          "region": "us-east-1",
+          "title": "CPU Utilization",
+          "yAxis": {"left": {"min": 0, "max": 100}}
+        }
+      },
+      {
+        "type": "metric",
+        "properties": {
+          "metrics": [
+            ["AWS/ApplicationELB", "RequestCount", {"stat": "Sum", "label": "Requests"}],
+            [".", "TargetResponseTime", {"stat": "Average", "yAxis": "right", "label": "Response Time (s)"}]
+          ],
+          "period": 300,
+          "region": "us-east-1",
+          "title": "ALB Metrics"
+        }
+      },
+      {
+        "type": "metric",
+        "properties": {
+          "metrics": [
+            ["AWS/ApplicationELB", "HealthyHostCount", {"stat": "Average", "label": "Healthy"}],
+            [".", "UnHealthyHostCount", {"stat": "Average", "label": "Unhealthy"}]
+          ],
+          "period": 60,
+          "region": "us-east-1",
+          "title": "Target Health"
+        }
+      },
+      {
+        "type": "metric",
+        "properties": {
+          "metrics": [
+            ["AWS/AutoScaling", "GroupDesiredCapacity", {"label": "Desired"}],
+            [".", "GroupInServiceInstances", {"label": "In Service"}],
+            [".", "GroupPendingInstances", {"label": "Pending"}],
+            [".", "GroupTerminatingInstances", {"label": "Terminating"}]
+          ],
+          "period": 300,
+          "region": "us-east-1",
+          "title": "Auto Scaling Group Status"
+        }
+      }
+    ]
+  }
+  JSON
+}
+
+// Outputs
+output "load_balancer_dns" {
+  value = lb.main.dns_name
+  description = "Load balancer DNS name"
+}
+
+output "target_group_arn" {
+  value = tg.app.arn
+  description = "Target group ARN"
+}
+
+output "autoscaling_group_name" {
+  value = asg.app.name
+  description = "Auto Scaling Group name"
+}
+
+output "dashboard_url" {
+  value = "https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:name=${dashboard.app.dashboard_name}"
+  description = "CloudWatch Dashboard URL"
+}

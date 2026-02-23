@@ -1,0 +1,632 @@
+// AWS Serverless API with Lambda, API Gateway, and DynamoDB
+// This example demonstrates a complete serverless REST API with:
+// - API Gateway HTTP API
+// - Lambda functions for CRUD operations
+// - DynamoDB for data storage
+// - CloudWatch for logging and monitoring
+
+variable "app_name" {
+  type = string
+  default = "users-api"
+}
+
+variable "environment" {
+  type = string
+  default = "production"
+}
+
+provider aws {
+  region = "us-east-1"
+  
+  default_tags = {
+    Application = var.app_name
+    Environment = var.environment
+    ManagedBy = "Aether"
+  }
+}
+
+// DynamoDB Table
+resource database.dynamodb_table "users" {
+  name = "${var.app_name}-users-${var.environment}"
+  billing_mode = "PAY_PER_REQUEST"
+  
+  hash_key = "userId"
+  range_key = "createdAt"
+  
+  attribute {
+    name = "userId"
+    type = "S"
+  }
+  
+  attribute {
+    name = "createdAt"
+    type = "N"
+  }
+  
+  attribute {
+    name = "email"
+    type = "S"
+  }
+  
+  attribute {
+    name = "status"
+    type = "S"
+  }
+  
+  // Global Secondary Index for email lookups
+  global_secondary_index {
+    name = "EmailIndex"
+    hash_key = "email"
+    projection_type = "ALL"
+  }
+  
+  // Global Secondary Index for filtering by status
+  global_secondary_index {
+    name = "StatusIndex"
+    hash_key = "status"
+    range_key = "createdAt"
+    projection_type = "ALL"
+  }
+  
+  // TTL for automatic deletion
+  ttl {
+    attribute_name = "expiresAt"
+    enabled = true
+  }
+  
+  // Point-in-time recovery
+  point_in_time_recovery {
+    enabled = true
+  }
+  
+  // Encryption at rest
+  server_side_encryption {
+    enabled = true
+    kms_master_key_id = kms_key.dynamodb.id
+  }
+  
+  // Streams for event processing
+  stream_enabled = true
+  stream_view_type = "NEW_AND_OLD_IMAGES"
+  
+  tags = {
+    Name = "${var.app_name}-users-table"
+  }
+}
+
+// KMS Key for encryption
+resource kms.key "dynamodb" {
+  description = "KMS key for DynamoDB encryption"
+  deletion_window_in_days = 30
+  enable_key_rotation = true
+  
+  tags = {
+    Name = "${var.app_name}-dynamodb-key"
+  }
+}
+
+// IAM Role for Lambda
+resource iam.role "lambda_exec" {
+  name = "${var.app_name}-lambda-role"
+  
+  assume_role_policy = <<-JSON
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Action": "sts:AssumeRole",
+        "Principal": {
+          "Service": "lambda.amazonaws.com"
+        },
+        "Effect": "Allow"
+      }
+    ]
+  }
+  JSON
+  
+  tags = {
+    Name = "${var.app_name}-lambda-role"
+  }
+}
+
+// IAM Policy for Lambda
+resource iam.policy "lambda_policy" {
+  name = "${var.app_name}-lambda-policy"
+  description = "IAM policy for Lambda functions"
+  
+  policy = <<-JSON
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:Query",
+          "dynamodb:Scan"
+        ],
+        "Resource": [
+          "${dynamodb_table.users.arn}",
+          "${dynamodb_table.users.arn}/index/*"
+        ]
+      },
+      {
+        "Effect": "Allow",
+        "Action": [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ],
+        "Resource": "arn:aws:logs:*:*:*"
+      },
+      {
+        "Effect": "Allow",
+        "Action": [
+          "xray:PutTraceSegments",
+          "xray:PutTelemetryRecords"
+        ],
+        "Resource": "*"
+      }
+    ]
+  }
+  JSON
+}
+
+resource iam.role_policy_attachment "lambda_policy" {
+  role = role.lambda_exec
+  policy_arn = policy.lambda_policy.arn
+}
+
+// Lambda Layer for shared dependencies
+resource lambda.layer "dependencies" {
+  layer_name = "${var.app_name}-dependencies"
+  description = "Common dependencies for Lambda functions"
+  
+  compatible_runtimes = ["python3.11"]
+  
+  // In practice, this would be a zip file with dependencies
+  source_code = file("layers/dependencies.zip")
+  
+  tags = {
+    Name = "${var.app_name}-dependencies"
+  }
+}
+
+// Lambda Functions
+// GET /users/{userId}
+resource compute.lambda_function "get_user" {
+  function_name = "${var.app_name}-get-user"
+  description = "Get user by ID"
+  
+  runtime = "python3.11"
+  handler = "get_user.handler"
+  
+  source_code = file("lambda/get_user.py")
+  
+  role = role.lambda_exec.arn
+  
+  layers = [layer.dependencies.arn]
+  
+  memory_size = 512
+  timeout = 30
+  
+  environment {
+    variables = {
+      TABLE_NAME = dynamodb_table.users.name
+      REGION = "us-east-1"
+      LOG_LEVEL = "INFO"
+    }
+  }
+  
+  tracing_config {
+    mode = "Active"
+  }
+  
+  tags = {
+    Name = "${var.app_name}-get-user"
+    Operation = "read"
+  }
+}
+
+// POST /users
+resource compute.lambda_function "create_user" {
+  function_name = "${var.app_name}-create-user"
+  description = "Create new user"
+  
+  runtime = "python3.11"
+  handler = "create_user.handler"
+  
+  source_code = file("lambda/create_user.py")
+  
+  role = role.lambda_exec.arn
+  
+  layers = [layer.dependencies.arn]
+  
+  memory_size = 512
+  timeout = 30
+  
+  environment {
+    variables = {
+      TABLE_NAME = dynamodb_table.users.name
+      REGION = "us-east-1"
+      LOG_LEVEL = "INFO"
+    }
+  }
+  
+  tracing_config {
+    mode = "Active"
+  }
+  
+  tags = {
+    Name = "${var.app_name}-create-user"
+    Operation = "write"
+  }
+}
+
+// PUT /users/{userId}
+resource compute.lambda_function "update_user" {
+  function_name = "${var.app_name}-update-user"
+  description = "Update existing user"
+  
+  runtime = "python3.11"
+  handler = "update_user.handler"
+  
+  source_code = file("lambda/update_user.py")
+  
+  role = role.lambda_exec.arn
+  
+  layers = [layer.dependencies.arn]
+  
+  memory_size = 512
+  timeout = 30
+  
+  environment {
+    variables = {
+      TABLE_NAME = dynamodb_table.users.name
+      REGION = "us-east-1"
+      LOG_LEVEL = "INFO"
+    }
+  }
+  
+  tracing_config {
+    mode = "Active"
+  }
+  
+  tags = {
+    Name = "${var.app_name}-update-user"
+    Operation = "write"
+  }
+}
+
+// DELETE /users/{userId}
+resource compute.lambda_function "delete_user" {
+  function_name = "${var.app_name}-delete-user"
+  description = "Delete user"
+  
+  runtime = "python3.11"
+  handler = "delete_user.handler"
+  
+  source_code = file("lambda/delete_user.py")
+  
+  role = role.lambda_exec.arn
+  
+  layers = [layer.dependencies.arn]
+  
+  memory_size = 512
+  timeout = 30
+  
+  environment {
+    variables = {
+      TABLE_NAME = dynamodb_table.users.name
+      REGION = "us-east-1"
+      LOG_LEVEL = "INFO"
+    }
+  }
+  
+  tracing_config {
+    mode = "Active"
+  }
+  
+  tags = {
+    Name = "${var.app_name}-delete-user"
+    Operation = "delete"
+  }
+}
+
+// GET /users
+resource compute.lambda_function "list_users" {
+  function_name = "${var.app_name}-list-users"
+  description = "List all users with pagination"
+  
+  runtime = "python3.11"
+  handler = "list_users.handler"
+  
+  source_code = file("lambda/list_users.py")
+  
+  role = role.lambda_exec.arn
+  
+  layers = [layer.dependencies.arn]
+  
+  memory_size = 1024
+  timeout = 60
+  
+  environment {
+    variables = {
+      TABLE_NAME = dynamodb_table.users.name
+      REGION = "us-east-1"
+      LOG_LEVEL = "INFO"
+    }
+  }
+  
+  tracing_config {
+    mode = "Active"
+  }
+  
+  tags = {
+    Name = "${var.app_name}-list-users"
+    Operation = "read"
+  }
+}
+
+// API Gateway HTTP API
+resource api.gateway "main" {
+  name = var.app_name
+  description = "Users API"
+  protocol_type = "HTTP"
+  
+  cors_configuration {
+    allow_origins = ["*"]
+    allow_methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+    allow_headers = ["Content-Type", "Authorization", "X-Api-Key"]
+    expose_headers = ["X-Request-Id"]
+    max_age = 300
+  }
+  
+  tags = {
+    Name = var.app_name
+  }
+}
+
+// API Gateway Integrations
+resource api.gateway_integration "get_user" {
+  api_id = api_gateway.main.id
+  integration_type = "AWS_PROXY"
+  integration_uri = lambda.get_user.invoke_arn
+  integration_method = "POST"
+  payload_format_version = "2.0"
+  timeout_milliseconds = 30000
+}
+
+resource api.gateway_integration "create_user" {
+  api_id = api_gateway.main.id
+  integration_type = "AWS_PROXY"
+  integration_uri = lambda.create_user.invoke_arn
+  integration_method = "POST"
+  payload_format_version = "2.0"
+  timeout_milliseconds = 30000
+}
+
+resource api.gateway_integration "update_user" {
+  api_id = api_gateway.main.id
+  integration_type = "AWS_PROXY"
+  integration_uri = lambda.update_user.invoke_arn
+  integration_method = "POST"
+  payload_format_version = "2.0"
+  timeout_milliseconds = 30000
+}
+
+resource api.gateway_integration "delete_user" {
+  api_id = api_gateway.main.id
+  integration_type = "AWS_PROXY"
+  integration_uri = lambda.delete_user.invoke_arn
+  integration_method = "POST"
+  payload_format_version = "2.0"
+  timeout_milliseconds = 30000
+}
+
+resource api.gateway_integration "list_users" {
+  api_id = api_gateway.main.id
+  integration_type = "AWS_PROXY"
+  integration_uri = lambda.list_users.invoke_arn
+  integration_method = "POST"
+  payload_format_version = "2.0"
+  timeout_milliseconds = 60000
+}
+
+// API Gateway Routes
+resource api.gateway_route "get_user" {
+  api_id = api_gateway.main.id
+  route_key = "GET /users/{userId}"
+  target = "integrations/${api_integration.get_user.id}"
+}
+
+resource api.gateway_route "create_user" {
+  api_id = api_gateway.main.id
+  route_key = "POST /users"
+  target = "integrations/${api_integration.create_user.id}"
+}
+
+resource api.gateway_route "update_user" {
+  api_id = api_gateway.main.id
+  route_key = "PUT /users/{userId}"
+  target = "integrations/${api_integration.update_user.id}"
+}
+
+resource api.gateway_route "delete_user" {
+  api_id = api_gateway.main.id
+  route_key = "DELETE /users/{userId}"
+  target = "integrations/${api_integration.delete_user.id}"
+}
+
+resource api.gateway_route "list_users" {
+  api_id = api_gateway.main.id
+  route_key = "GET /users"
+  target = "integrations/${api_integration.list_users.id}"
+}
+
+// API Gateway Stage
+resource api.gateway_stage "production" {
+  api_id = api_gateway.main.id
+  name = var.environment
+  auto_deploy = true
+  
+  access_log_settings {
+    destination_arn = cloudwatch_log_group.api_access.arn
+    format = jsonencode({
+      requestId = "$context.requestId"
+      ip = "$context.identity.sourceIp"
+      requestTime = "$context.requestTime"
+      httpMethod = "$context.httpMethod"
+      routeKey = "$context.routeKey"
+      status = "$context.status"
+      protocol = "$context.protocol"
+      responseLength = "$context.responseLength"
+      integrationError = "$context.integrationErrorMessage"
+    })
+  }
+  
+  default_route_settings {
+    throttling_burst_limit = 5000
+    throttling_rate_limit = 10000
+  }
+  
+  tags = {
+    Environment = var.environment
+  }
+}
+
+// Lambda Permissions for API Gateway
+resource lambda.permission "get_user" {
+  function_name = lambda.get_user.function_name
+  action = "lambda:InvokeFunction"
+  principal = "apigateway.amazonaws.com"
+  source_arn = "${api_gateway.main.execution_arn}/*/*"
+}
+
+resource lambda.permission "create_user" {
+  function_name = lambda.create_user.function_name
+  action = "lambda:InvokeFunction"
+  principal = "apigateway.amazonaws.com"
+  source_arn = "${api_gateway.main.execution_arn}/*/*"
+}
+
+resource lambda.permission "update_user" {
+  function_name = lambda.update_user.function_name
+  action = "lambda:InvokeFunction"
+  principal = "apigateway.amazonaws.com"
+  source_arn = "${api_gateway.main.execution_arn}/*/*"
+}
+
+resource lambda.permission "delete_user" {
+  function_name = lambda.delete_user.function_name
+  action = "lambda:InvokeFunction"
+  principal = "apigateway.amazonaws.com"
+  source_arn = "${api_gateway.main.execution_arn}/*/*"
+}
+
+resource lambda.permission "list_users" {
+  function_name = lambda.list_users.function_name
+  action = "lambda:InvokeFunction"
+  principal = "apigateway.amazonaws.com"
+  source_arn = "${api_gateway.main.execution_arn}/*/*"
+}
+
+// CloudWatch Log Groups
+resource monitoring.log_group "api_access" {
+  name = "/aws/apigateway/${var.app_name}"
+  retention_in_days = 30
+  
+  tags = {
+    Name = "${var.app_name}-api-access-logs"
+  }
+}
+
+// CloudWatch Alarms
+resource monitoring.alarm "api_errors" {
+  alarm_name = "${var.app_name}-api-errors"
+  alarm_description = "Alert on high API error rate"
+  
+  namespace = "AWS/ApiGateway"
+  metric_name = "5XXError"
+  
+  dimensions = {
+    ApiId = api_gateway.main.id
+    Stage = api_stage.production.name
+  }
+  
+  statistic = "Sum"
+  period = 300
+  evaluation_periods = 2
+  threshold = 10
+  comparison_operator = "GreaterThanThreshold"
+  
+  alarm_actions = [sns_topic.alerts.arn]
+  
+  treat_missing_data = "notBreaching"
+}
+
+resource monitoring.alarm "lambda_errors" {
+  alarm_name = "${var.app_name}-lambda-errors"
+  alarm_description = "Alert on Lambda function errors"
+  
+  namespace = "AWS/Lambda"
+  metric_name = "Errors"
+  
+  statistic = "Sum"
+  period = 300
+  evaluation_periods = 2
+  threshold = 5
+  comparison_operator = "GreaterThanThreshold"
+  
+  alarm_actions = [sns_topic.alerts.arn]
+}
+
+resource monitoring.alarm "dynamodb_throttle" {
+  alarm_name = "${var.app_name}-dynamodb-throttle"
+  alarm_description = "Alert on DynamoDB throttling"
+  
+  namespace = "AWS/DynamoDB"
+  metric_name = "UserErrors"
+  
+  dimensions = {
+    TableName = dynamodb_table.users.name
+  }
+  
+  statistic = "Sum"
+  period = 300
+  evaluation_periods = 1
+  threshold = 0
+  comparison_operator = "GreaterThanThreshold"
+  
+  alarm_actions = [sns_topic.critical_alerts.arn]
+}
+
+// Outputs
+output "api_endpoint" {
+  value = "${api_gateway.main.api_endpoint}/${api_stage.production.name}"
+  description = "API Gateway endpoint URL"
+}
+
+output "api_id" {
+  value = api_gateway.main.id
+  description = "API Gateway ID"
+}
+
+output "dynamodb_table_name" {
+  value = dynamodb_table.users.name
+  description = "DynamoDB table name"
+}
+
+output "lambda_functions" {
+  value = {
+    get_user = lambda.get_user.function_name
+    create_user = lambda.create_user.function_name
+    update_user = lambda.update_user.function_name
+    delete_user = lambda.delete_user.function_name
+    list_users = lambda.list_users.function_name
+  }
+  description = "Lambda function names"
+}
