@@ -1,0 +1,83 @@
+# Example: Simple Web Server
+
+resource network.vpc "main" {
+  cidr = "10.0.0.0/16"
+  region = "us-east"
+  
+  tags = {
+    Name = "main-vpc"
+    Environment = "production"
+  }
+}
+
+resource network.subnet "public" {
+  vpc = vpc.main
+  cidr = "10.0.1.0/24"
+  availability_zone = "us-east-1a"
+  public = true
+  
+  tags = {
+    Name = "public-subnet"
+  }
+}
+
+resource network.security_group "web" {
+  vpc = vpc.main
+  description = "Allow HTTP and HTTPS traffic"
+  
+  ingress {
+    from_port = 80
+    to_port = 80
+    protocol = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  ingress {
+    from_port = 443
+    to_port = 443
+    protocol = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  egress {
+    from_port = 0
+    to_port = 0
+    protocol = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = {
+    Name = "web-security-group"
+  }
+}
+
+resource compute.instance "web_server" {
+  machine_type = "medium"
+  os_image = "ubuntu-22.04"
+  subnet = subnet.public
+  security_groups = [sg.web]
+  
+  user_data = <<-EOF
+    #!/bin/bash
+    apt-get update
+    apt-get install -y nginx
+    systemctl start nginx
+    systemctl enable nginx
+  EOF
+  
+  tags = {
+    Name = "web-server"
+    Role = "webserver"
+    Environment = "production"
+  }
+}
+
+output "server_ip" {
+  value = instance.web_server.public_ip
+  description = "Public IP address of the web server"
+}
+
+output "vpc_id" {
+  value = vpc.main.id
+  description = "ID of the VPC"
+}
